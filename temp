@@ -1,0 +1,3 @@
+-- FETCH FIRST (limit gibi)
+SELECT * FROM tablo
+FETCH FIRST 10 ROWS ONLY
