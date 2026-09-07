@@ -1,42 +1,730 @@
--- FETCH FIRST (limit gibi)
-SELECT * FROM tablo
-FETCH FIRST 10 ROWS ONLY
+
+# =============================================================================
+# ÖNCÜLLERDEN 12M90 TAHMİN MODELİ - DÜZELTİLMİŞ TAM VERSİYON
+# =============================================================================
+# Kohort mantığı:
+#   DONEM = kartın açıldığı ay (vintage)
+#   2M30  = o kohortun 2 ay içinde 30+ gecikme oranı  -> kohort+2 ayda bilinir
+#   12M90 = o kohortun 12 ay içinde 90+ gecikme oranı -> kohort+12 ayda bilinir
+#   Amaç: erken öncüllerle 12M90'ı ~10 ay önceden tahmin etmek
+#
+# Önceki versiyona göre DEĞİŞENLER:
+#   1) shuffle=True random split KALDIRILDI -> TimeSeriesSplit (walk-forward)
+#   2) OOT 3 gözlemden 12 gözleme çıkarıldı
+#   3) Seçim skoru 3 gözleme değil, 5 CV katı + OOT'ye dayanıyor
+#   4) Kararlılık cezası (CV_MAPE_STD) eklendi
+#   5) Gecerli filtresi gerçekten ayrıştırıyor
+#   6) Şampiyon model production için TÜM veri ile yeniden fit ediliyor
+#   7) Durbin-Watson + Ljung-Box + HAC (Newey-West) otokorelasyon teşhisi
+# =============================================================================
+
+
+# =============================================================================
+# 1) MODELLEME ÇALIŞMASI - IMPORTLAR
+# =============================================================================
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import TimeSeriesSplit
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
+from itertools import combinations
+
+from sklearn.linear_model import LinearRegression, RidgeCV, LassoCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+import statsmodels.api as sm
+from statsmodels.stats.stattools import durbin_watson
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+
+# =============================================================================
+# 2) BDS ÖNCÜLLER - HAM VERİ
+# =============================================================================
+# NOT: Kendi raw_data string'ini buraya yapıştır (tab ayraçlı, virgüllü ondalık).
+raw_data = """DONEM	T Takip 90 + L12M	T Takip 90 + L6M	T Takip 90 + L5M	T Takip 60 + L5M	T Takip 90 + L4M	T Takip 60 + L4M	T Takip 30 + L4M	T Takip 30 + L3M	T Takip 30 + L2M	T Takip 20 + L2M
+201910	0,023045	0,008181	0,005876	0,011534	0,001803	0,007762	0,021960	0,015000	0,003000	0,004000
+"""  # <-- TAM VERİYİ BURAYA KOY
+
+# Uzun kolon adı -> kısa ad
+rename_map = {
+    "T Takip 90 + L12M": "12M90",
+    "T Takip 90 + L6M":  "6M90",
+    "T Takip 90 + L5M":  "5M90",
+    "T Takip 60 + L5M":  "5M60",
+    "T Takip 90 + L4M":  "4M90",
+    "T Takip 60 + L4M":  "4M60",
+    "T Takip 30 + L4M":  "4M30",
+    "T Takip 30 + L3M":  "3M30",
+    "T Takip 30 + L2M":  "2M30",
+    "T Takip 20 + L2M":  "2M20",
+}
+
+
+# =============================================================================
+# 3) VERİ HAZIRLIK
+# =============================================================================
+lines  = [l for l in raw_data.strip().splitlines() if l.strip()]
+header = lines[0].split("\t")
+value_cols = header[1:]
+
+rows = []
+for line in lines[1:]:
+    parts = line.split("\t")
+    row = {"DONEM": int(parts[0])}
+    for col, val in zip(value_cols, parts[1:]):
+        row[rename_map[col]] = float(val.replace(",", ".")) * 100
+    rows.append(row)
+
+train_df = pd.DataFrame(rows).sort_values("DONEM").reset_index(drop=True)
+train_df = train_df[["DONEM"] + list(rename_map.values())]
+
+print(f"Veri: {len(train_df)} kohort | {train_df['DONEM'].min()} - {train_df['DONEM'].max()}")
+
+
+# =============================================================================
+# 4) IMPORT + KONFİGÜRASYON
+# =============================================================================
+CONFIG = {
+    "TARGET":   "12M90",
+    "FEATURES": ["5M60", "4M60", "4M30", "3M30", "2M30", "2M20"],
+
+    # DEĞİŞTİ: 2019 verisi de dahil, OOT öncesi her şey pool
+    "POOL_RANGE": (201910, 202407),
+    "OOT_RANGE":  (202408, 202507),   # DEĞİŞTİ: 3 -> 12 gözlem
+    "N_SPLITS":   5,                  # YENİ: walk-forward kat sayısı
+
+    "APPLY_DONEM": "202602",
+    "MIN_FEATURES": 1,
+    "ALPHAS": np.logspace(-3, 4, 80),
+    "MODEL_OPTIONS": ["ridge", "lasso", "ols"],
+    "LASSO_MAX_ITER": 200000,
+
+    "SEASON_OPTIONS":  [False],
+    "ROLLING_OPTIONS": [False],
+    "ROLLING_PENCERE": 3,
+}
+
+FEATURES = CONFIG["FEATURES"]
+y = train_df[CONFIG["TARGET"]].astype(float).values
+
+
+# =============================================================================
+# 5) VERİ HAZIRLIK + WALK-FORWARD SPLIT (shuffle YOK)
+# =============================================================================
 def aralik_mask(df, aralik):
     lo, hi = aralik
     return ((df["DONEM"] >= lo) & (df["DONEM"] <= hi)).values
 
-# ---- OOT'yi genişlet: 3 gözlem yerine 12 ----
-CONFIG["TRAIN_TEST_RANGE"] = (201910, 202407)   # tüm geçmişi kullan
-CONFIG["OOT_RANGE"]        = (202408, 202507)   # 12 gözlem
-CONFIG["N_SPLITS"]         = 5
 
 m_oot      = aralik_mask(train_df, CONFIG["OOT_RANGE"])
-m_pool_raw = aralik_mask(train_df, CONFIG["TRAIN_TEST_RANGE"])
+m_pool_raw = aralik_mask(train_df, CONFIG["POOL_RANGE"])
 m_pool     = m_pool_raw & (~m_oot)
 
-# ---- KRONOLOJİK sıra (shuffle YOK) ----
+# KRONOLOJİK sıra — random shuffle YOK
 pool_idx = np.where(m_pool)[0]
 pool_idx = pool_idx[np.argsort(train_df["DONEM"].values[pool_idx])]
 
 if len(pool_idx) < 20:
-    raise ValueError(f"Pool'da {len(pool_idx)} gözlem var, CV için az.")
+    raise ValueError(f"Pool'da sadece {len(pool_idx)} gözlem var, CV için yetersiz.")
 
 tscv = TimeSeriesSplit(n_splits=CONFIG["N_SPLITS"])
 CV_FOLDS = [(pool_idx[tr], pool_idx[te]) for tr, te in tscv.split(pool_idx)]
 
-# Son kat = "holdout test", tüm pool = final fit havuzu
+# Tüm pool = final fit havuzu (CV bittikten sonra)
 m_train_full = np.zeros(len(train_df), dtype=bool)
 m_train_full[pool_idx] = True
 
-print("=== SPLIT ÖZETİ ===")
+if (m_train_full & m_oot).any():
+    raise ValueError("Pool ile OOT çakışıyor, range kontrol et.")
+
+print("=== SPLIT ÖZETİ (WALK-FORWARD) ===")
 print(f"Pool: {len(pool_idx)} gözlem | OOT: {m_oot.sum()} gözlem")
+_d = train_df["DONEM"].values
 for i, (tr, te) in enumerate(CV_FOLDS, 1):
-    d = train_df["DONEM"].values
-    print(f"  Kat {i}: train {d[tr].min()}-{d[tr].max()} ({len(tr)}) "
-          f"-> test {d[te].min()}-{d[te].max()} ({len(te)})")
-print(f"OOT: {train_df['DONEM'].values[m_oot].min()}-"
-      f"{train_df['DONEM'].values[m_oot].max()}")
+    print(f"  Kat {i}: train {_d[tr].min()}-{_d[tr].max()} ({len(tr):>2}) "
+          f"-> test {_d[te].min()}-{_d[te].max()} ({len(te):>2})")
+print(f"  OOT  : {_d[m_oot].min()}-{_d[m_oot].max()} ({m_oot.sum()})")
+
+
+# =============================================================================
+# 6) FEATURE ÜRETİMİ + MODEL FACTORY + METRİK FONKSİYONLARI
+# =============================================================================
+def mevsim_ekle(donem_serisi):
+    ay = donem_serisi.astype(str).str[-2:].astype(int)
+    return pd.DataFrame({
+        "sin_ay": np.sin(2 * np.pi * ay / 12),
+        "cos_ay": np.cos(2 * np.pi * ay / 12),
+    }, index=donem_serisi.index)
+
+
+def make_X(metric_df, feats, donem_series=None, mevsim=False, rolling=False):
+    X = metric_df[feats].reset_index(drop=True).copy()
+
+    if rolling:
+        p = CONFIG["ROLLING_PENCERE"]
+        for f in feats:
+            X[f"{f}_ma{p}"] = X[f].rolling(p, min_periods=1).mean()
+
+    if mevsim:
+        if donem_series is None:
+            raise ValueError("mevsim=True için donem_series gerekli.")
+        X = pd.concat([X, mevsim_ekle(donem_series.reset_index(drop=True))], axis=1)
+
+    return X
+
+
+def pipe_factory(model_name):
+    m = str(model_name).lower()
+    if m == "ridge":
+        model = RidgeCV(alphas=CONFIG["ALPHAS"])
+    elif m == "lasso":
+        model = LassoCV(alphas=CONFIG["ALPHAS"], cv=5,
+                        max_iter=CONFIG["LASSO_MAX_ITER"])
+    elif m in ["ols", "linearregression"]:
+        model = LinearRegression()
+    else:
+        raise ValueError(f"Bilinmeyen model: {model_name}")
+
+    return Pipeline([("scale", StandardScaler()), ("model", model)])
+
+
+def metrikler(y_true, y_pred, n_feat):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    n = len(y_true)
+
+    if n == 0:
+        return {k: np.nan for k in ["R2", "AdjR2", "RMSE", "MAE", "MAPE", "WMAPE"]}
+
+    r2   = r2_score(y_true, y_pred) if n > 1 else np.nan
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae  = mean_absolute_error(y_true, y_pred)
+
+    eps   = 1e-12
+    mape  = np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), eps))) * 100
+    wmape = (np.sum(np.abs(y_true - y_pred))
+             / np.maximum(np.sum(np.abs(y_true)), eps)) * 100
+
+    adj = (1 - (1 - r2) * (n - 1) / (n - n_feat - 1)
+           if (not np.isnan(r2) and n - n_feat - 1 > 0) else np.nan)
+
+    return {"R2": r2, "AdjR2": adj, "RMSE": rmse,
+            "MAE": mae, "MAPE": mape, "WMAPE": wmape}
+
+
+def trend_metrikleri(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    # DEĞİŞTİ: 3 -> 6. n=3'te TrendCorr her zaman ±1 çıkıyordu (bilgisiz metrik)
+    if len(y_true) < 6:
+        return {"TrendCorr": np.nan, "DirectionAcc": np.nan}
+
+    dy = np.diff(y_true)
+    dp = np.diff(y_pred)
+
+    if np.std(dy) < 1e-12 or np.std(dp) < 1e-12:
+        trend_corr = np.nan
+    else:
+        trend_corr = np.corrcoef(dy, dp)[0, 1]
+
+    direction_acc = np.mean(np.sign(dy) == np.sign(dp))
+    return {"TrendCorr": trend_corr, "DirectionAcc": direction_acc}
+
+
+def nz(x, default):
+    return default if pd.isna(x) else x
+
+
+# =============================================================================
+# 7) MODEL DENEME FONKSİYONU + TÜM KOMBİNASYON TARAMASI
+# =============================================================================
+def deneme_yap(feats, mevsim, rolling, model_name):
+    feats = list(feats)
+    X = make_X(train_df, feats, train_df["DONEM"], mevsim, rolling)
+    n_feat = X.shape[1]
+
+    # ---- 1) WALK-FORWARD CV (asıl performans ölçümü) ----
+    cv_mae, cv_mape, cv_wmape, cv_r2 = [], [], [], []
+    for tr_idx, te_idx in CV_FOLDS:
+        mdl = pipe_factory(model_name).fit(X.iloc[tr_idx], y[tr_idx])
+        d = metrikler(y[te_idx], mdl.predict(X.iloc[te_idx]), n_feat)
+        cv_mae.append(d["MAE"]);   cv_mape.append(d["MAPE"])
+        cv_wmape.append(d["WMAPE"]); cv_r2.append(d["R2"])
+
+    CV_MAE      = np.mean(cv_mae)
+    CV_MAPE     = np.mean(cv_mape)
+    CV_WMAPE    = np.mean(cv_wmape)
+    CV_R2       = np.mean(cv_r2)
+    CV_MAPE_STD = np.std(cv_mape)          # katlar arası kararlılık
+
+    # ---- 2) Tüm pool ile fit -> OOT değerlendirmesi ----
+    model = pipe_factory(model_name).fit(X[m_train_full], y[m_train_full])
+    mtr = metrikler(y[m_train_full], model.predict(X[m_train_full]), n_feat)
+    moo = metrikler(y[m_oot],        model.predict(X[m_oot]),        n_feat)
+
+    overfit_mape = abs(mtr["MAPE"] - CV_MAPE)   # train içi vs CV
+    drift_mape   = abs(CV_MAPE - moo["MAPE"])   # CV vs OOT (rejim kayması)
+    drift_mae    = abs(CV_MAE  - moo["MAE"])
+
+    tr_oot     = trend_metrikleri(y[m_oot], model.predict(X[m_oot]))
+    trend_corr = tr_oot["TrendCorr"]
+    dir_acc    = tr_oot["DirectionAcc"]
+
+    # ---- 3) SEÇİM SKORU (küçük = iyi) ----
+    trend_pen = ((1 - np.clip(nz(trend_corr, -1), -1, 1)) / 2) * 5
+    dir_pen   = (1 - nz(dir_acc, 0)) * 5
+
+    secim_skoru = (
+        0.35 * CV_MAPE +                # ana kriter: walk-forward hata
+        0.20 * (CV_MAPE_STD * 2) +      # kararsız modeli cezalandır
+        0.20 * moo["MAPE"] +            # OOT hatası
+        0.10 * (CV_MAE * 100) +         # ölçek uyumu
+        0.10 * drift_mape +             # rejim kayması
+        0.05 * overfit_mape +
+        trend_pen +
+        dir_pen
+    )
+
+    sk_model  = model.named_steps["model"]
+    alpha_val = getattr(sk_model, "alpha_", np.nan)
+
+    return {
+        "model": model_name,
+        "alpha": round(float(alpha_val), 6) if not pd.isna(alpha_val) else np.nan,
+        "feats": ",".join(feats),
+        "n_feat": len(feats),
+        "mevsim": mevsim,
+        "rolling": rolling,
+
+        "CV_R2":       round(CV_R2, 3),
+        "CV_MAE":      round(CV_MAE, 4),
+        "CV_MAPE":     round(CV_MAPE, 2),
+        "CV_MAPE_STD": round(CV_MAPE_STD, 2),
+        "CV_WMAPE":    round(CV_WMAPE, 2),
+
+        "Train_R2":    round(mtr["R2"], 3),
+        "Train_MAE":   round(mtr["MAE"], 4),
+        "Train_MAPE":  round(mtr["MAPE"], 2),
+
+        "OOT_R2":      round(moo["R2"], 3),
+        "OOT_AdjR2":   round(moo["AdjR2"], 3) if not pd.isna(moo["AdjR2"]) else np.nan,
+        "OOT_RMSE":    round(moo["RMSE"], 4),
+        "OOT_MAE":     round(moo["MAE"], 4),
+        "OOT_MAPE":    round(moo["MAPE"], 2),
+        "OOT_WMAPE":   round(moo["WMAPE"], 2),
+
+        "Overfit_MAPE": round(overfit_mape, 3),
+        "Drift_MAPE":   round(drift_mape, 3),
+        "Drift_MAE":    round(drift_mae, 4),
+
+        "TrendCorr_OOT":    round(trend_corr, 3) if not np.isnan(nz(trend_corr, np.nan)) else np.nan,
+        "DirectionAcc_OOT": round(dir_acc, 3) if not np.isnan(nz(dir_acc, np.nan)) else np.nan,
+
+        "SecimSkoru": round(secim_skoru, 4),
+    }
+
+
+# ---- Tüm kombinasyon taraması ----
+kayit = []
+for model_name in CONFIG["MODEL_OPTIONS"]:
+    for r in range(CONFIG["MIN_FEATURES"], len(FEATURES) + 1):
+        for feats in combinations(FEATURES, r):
+            for mevsim in CONFIG["SEASON_OPTIONS"]:
+                for rolling in CONFIG["ROLLING_OPTIONS"]:
+                    kayit.append(deneme_yap(feats, mevsim, rolling, model_name))
+
+tum_denemeler = pd.DataFrame(kayit)
+
+# Geçerlilik filtresi — artık CV üzerinden, gerçekten ayrıştırıyor
+tum_denemeler["Gecerli"] = (
+    (tum_denemeler["CV_R2"]      > 0) &
+    (tum_denemeler["Train_R2"]   > 0) &
+    (tum_denemeler["Drift_MAPE"] < 15)
+)
+
+tum_denemeler = tum_denemeler.sort_values(
+    ["Gecerli", "SecimSkoru", "n_feat"],
+    ascending=[False, True, True]
+).reset_index(drop=True)
+tum_denemeler["Sira"] = np.arange(1, len(tum_denemeler) + 1)
+
+print(f"\nToplam {len(tum_denemeler)} deneme | "
+      f"Gecerli: {tum_denemeler['Gecerli'].sum()} "
+      f"({tum_denemeler['Gecerli'].mean()*100:.0f}%)")
+
+
+# =============================================================================
+# 8) TOP 10 MODEL
+# =============================================================================
+goster = [
+    "Sira", "Gecerli", "model", "alpha", "feats", "n_feat",
+    "CV_R2", "CV_MAPE", "CV_MAPE_STD", "CV_MAE",
+    "Train_R2", "Train_MAPE",
+    "OOT_R2", "OOT_MAPE", "OOT_MAE", "OOT_WMAPE",
+    "Overfit_MAPE", "Drift_MAPE",
+    "TrendCorr_OOT", "DirectionAcc_OOT", "SecimSkoru",
+]
+goster = [c for c in goster if c in tum_denemeler.columns]
+top10 = tum_denemeler[goster].head(10).copy()
+
+print("\n=== EN İYİ 10 MODEL ===")
+print(top10.to_string(index=False))
+
+
+# =============================================================================
+# 9) ŞAMPİYON MODEL DONDURMA
+# =============================================================================
+en_iyi = tum_denemeler.iloc[0].copy()
+
+SECILEN_MODEL_KEY = str(en_iyi["model"]).lower()
+SECILEN_FEATS     = [f.strip() for f in str(en_iyi["feats"]).split(",") if f.strip()]
+SECILEN_MEVSIM    = bool(en_iyi["mevsim"])
+SECILEN_ROLLING   = bool(en_iyi["rolling"])
+
+X_model    = make_X(train_df, SECILEN_FEATS, train_df["DONEM"],
+                    SECILEN_MEVSIM, SECILEN_ROLLING)
+FEAT_MODEL = list(X_model.columns)
+
+# Model SEÇİMİ bitti -> production için TÜM veri (pool + OOT)
+m_final = m_train_full | m_oot
+champion_model = pipe_factory(SECILEN_MODEL_KEY).fit(X_model[m_final], y[m_final])
+
+sk_model = champion_model.named_steps["model"]
+scaler   = champion_model.named_steps["scale"]
+
+coef_std      = np.ravel(sk_model.coef_).astype(float)
+intercept_std = float(sk_model.intercept_)
+scaler_mean   = scaler.mean_.astype(float)
+scaler_std    = scaler.scale_.astype(float)
+
+# Ham (orijinal) uzay eşdeğeri: y = b0_raw + Σ b_raw * x
+coef_raw      = coef_std / scaler_std
+intercept_raw = intercept_std - np.sum(coef_raw * scaler_mean)
+
+CHAMPION = {
+    "model_key":      SECILEN_MODEL_KEY,
+    "features_base":  SECILEN_FEATS,
+    "features_model": FEAT_MODEL,
+    "mevsim":         SECILEN_MEVSIM,
+    "rolling":        SECILEN_ROLLING,
+    "pipeline":       champion_model,
+    "coef_std":       coef_std,
+    "intercept_std":  intercept_std,
+    "scaler_mean":    scaler_mean,
+    "scaler_std":     scaler_std,
+    "coef_raw":       coef_raw,
+    "intercept_raw":  intercept_raw,
+    "n_fit":          int(m_final.sum()),
+}
+
+print("\n=== CHAMPION DONDURULDU ===")
+print("Model    :", CHAMPION["model_key"])
+print("Features :", CHAMPION["features_model"])
+print("Fit veri :", CHAMPION["n_fit"], "gözlem (pool + OOT)")
+print("Intercept:", round(intercept_std, 6))
+print("Coef     :", [round(v, 6) for v in coef_std])
+
+
+# =============================================================================
+# 10) ANA MODEL PERFORMANS TABLOSU
+# =============================================================================
+# NOT: Seçim modeli (sadece pool ile fit) üzerinden raporlanır ki
+#      OOT gerçekten "görülmemiş" kalsın.
+ana_model = pipe_factory(SECILEN_MODEL_KEY).fit(X_model[m_train_full], y[m_train_full])
+
+perf_rows = []
+
+# Walk-forward CV katları
+for i, (tr_idx, te_idx) in enumerate(CV_FOLDS, 1):
+    mdl = pipe_factory(SECILEN_MODEL_KEY).fit(X_model.iloc[tr_idx], y[tr_idx])
+    d = metrikler(y[te_idx], mdl.predict(X_model.iloc[te_idx]), len(FEAT_MODEL))
+    perf_rows.append({
+        "Split": f"CV-Kat{i}",
+        "n": len(te_idx),
+        "R2": round(d["R2"], 3), "RMSE": round(d["RMSE"], 4),
+        "MAE": round(d["MAE"], 4), "MAPE": round(d["MAPE"], 2),
+        "WMAPE": round(d["WMAPE"], 2),
+    })
+
+# Train (in-sample) ve OOT
+for ad, m in [("Train(pool)", m_train_full), ("OOT", m_oot)]:
+    d = metrikler(y[m], ana_model.predict(X_model[m]), len(FEAT_MODEL))
+    perf_rows.append({
+        "Split": ad,
+        "n": int(m.sum()),
+        "R2": round(d["R2"], 3), "RMSE": round(d["RMSE"], 4),
+        "MAE": round(d["MAE"], 4), "MAPE": round(d["MAPE"], 2),
+        "WMAPE": round(d["WMAPE"], 2),
+    })
+
+perf_df = pd.DataFrame(perf_rows)
+print("\n=== ANA MODEL PERFORMANS ===")
+print(perf_df.to_string(index=False))
+
+coef = pd.Series(np.ravel(ana_model.named_steps["model"].coef_), index=FEAT_MODEL)
+print(f"\nIntercept: {float(ana_model.named_steps['model'].intercept_):.4f}")
+print(pd.DataFrame({"Feature": FEAT_MODEL,
+                    "Katsayi_std": coef.round(4).values}).to_string(index=False))
+
+
+# =============================================================================
+# 11) TRAIN-CV-OOT GRAFİKLER
+# =============================================================================
+def plot_trend_odakli_ozet(df, y, pred, m_pool_, m_oot_, target_col):
+    y    = np.asarray(y, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+
+    donem = df["DONEM"].values
+    xpos  = np.arange(len(donem))
+
+    y_trend = pd.Series(y).rolling(3, min_periods=1).mean().values
+    p_trend = pd.Series(pred).rolling(3, min_periods=1).mean().values
+
+    # --- 1) Zaman serisi ---
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(xpos, y,       "o-", color="#1f77b4", alpha=0.35, label=f"Gerçek {target_col}")
+    ax.plot(xpos, pred,    "^-", color="red",     alpha=0.35, label="Tahmin")
+    ax.plot(xpos, y_trend, "-",  color="#1f77b4", lw=2.2, label="Gerçek trend(3A)")
+    ax.plot(xpos, p_trend, "-",  color="red",     lw=2.2, label="Tahmin trend(3A)")
+
+    for p in np.where(m_pool_)[0]:
+        ax.axvspan(p - 0.5, p + 0.5, color="#1f77b4", alpha=0.05)
+    for p in np.where(m_oot_)[0]:
+        ax.axvspan(p - 0.5, p + 0.5, color="green", alpha=0.10)
+
+    ax.set_title(f"Gerçek vs Tahmin + Trend ({target_col})")
+    ax.set_xlabel("Dönem"); ax.set_ylabel(f"{target_col} (%)")
+    ax.set_xticks(xpos); ax.set_xticklabels(donem, rotation=90)
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f"))
+    ax.grid(alpha=0.25); ax.legend()
+    plt.tight_layout(); plt.show()
+
+    # --- 2) Tahmin vs Gerçek scatter ---
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(y[m_pool_], pred[m_pool_], color="#1f77b4", s=50, label="Pool")
+    ax.scatter(y[m_oot_],  pred[m_oot_],  color="green", s=80,
+               edgecolor="k", label="OOT")
+    lim = [min(y.min(), pred.min()) - 0.05, max(y.max(), pred.max()) + 0.05]
+    ax.plot(lim, lim, "k--", lw=1, label="İdeal y=x")
+    ax.set_xlim(lim); ax.set_ylim(lim)
+    ax.set_title("Tahmin vs Gerçek")
+    ax.set_xlabel(f"Gerçek {target_col} (%)"); ax.set_ylabel("Tahmin (%)")
+    ax.grid(alpha=0.25); ax.legend()
+    plt.tight_layout(); plt.show()
+
+    # --- 3) Artıklar ---
+    artik = y - pred
+    renk  = np.where(m_oot_, "green", np.where(m_pool_, "#4c78a8", "#cccccc"))
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.bar(xpos, artik, color=renk)
+    ax.axhline(0, color="gray", lw=0.8)
+    ax.set_title("Artıklar (Gerçek - Tahmin)")
+    ax.set_xlabel("Dönem"); ax.set_ylabel("Hata")
+    ax.set_xticks(xpos); ax.set_xticklabels(donem, rotation=90)
+    ax.grid(alpha=0.25)
+    plt.tight_layout(); plt.show()
+
+
+pred_all = np.asarray(ana_model.predict(X_model), dtype=float)
+plot_trend_odakli_ozet(train_df, y, pred_all, m_train_full, m_oot, CONFIG["TARGET"])
+
+
+# --- Model haritası: CV_MAPE vs OOT_MAPE ---
+top30 = tum_denemeler.head(30).copy()
+fig, ax = plt.subplots(figsize=(7, 5))
+sc = ax.scatter(top30["CV_MAPE"], top30["OOT_MAPE"],
+                c=top30["SecimSkoru"], cmap="viridis", s=70)
+for _, r in top30.iterrows():
+    ax.text(r["CV_MAPE"], r["OOT_MAPE"], str(int(r["Sira"])), fontsize=8)
+cbar = plt.colorbar(sc, ax=ax); cbar.set_label("SecimSkoru (düşük iyi)")
+ax.set_xlabel("CV_MAPE (düşük iyi)"); ax.set_ylabel("OOT_MAPE (düşük iyi)")
+ax.set_title("Model Haritası — köşegen üstü = OOT'de bozulan modeller")
+lim = [0, max(top30["CV_MAPE"].max(), top30["OOT_MAPE"].max()) * 1.1]
+ax.plot(lim, lim, "k--", lw=1, alpha=0.5)
+ax.grid(alpha=0.25)
+plt.tight_layout(); plt.show()
+
+
+# =============================================================================
+# 12) OLS DİAGNOSTİK — OTOKORELASYON + VIF + HAC
+# =============================================================================
+Xc   = sm.add_constant(X_model[m_train_full].values)
+ols  = sm.OLS(y[m_train_full], Xc).fit()
+resid = ols.resid
+
+print("\n=== OLS DİAGNOSTİK (pool üzerinde) ===")
+print(ols.summary())
+
+# --- Durbin-Watson ---
+dw = durbin_watson(resid)
+print(f"\nDurbin-Watson: {dw:.3f}")
+print("  <1.5 : pozitif otokorelasyon VAR")
+print("  ~2.0 : temiz")
+print("  >2.5 : negatif otokorelasyon")
+
+# --- Ljung-Box ---
+maxlag = min(12, len(resid) // 4)
+lb = acorr_ljungbox(resid, lags=list(range(1, maxlag + 1)), return_df=True)
+print("\nLjung-Box (p<0.05 -> otokorelasyon VAR):")
+print(lb.round(4).to_string())
+
+# --- HAC (Newey-West) düzeltilmiş standart hatalar ---
+ols_hac = sm.OLS(y[m_train_full], Xc).fit(cov_type="HAC", cov_kwds={"maxlags": 4})
+karsilastirma = pd.DataFrame({
+    "degisken":  ["const"] + FEAT_MODEL,
+    "katsayi":   ols.params.round(4),
+    "se_normal": ols.bse.round(4),
+    "se_HAC":    ols_hac.bse.round(4),
+    "t_normal":  ols.tvalues.round(2),
+    "t_HAC":     ols_hac.tvalues.round(2),
+    "p_HAC":     ols_hac.pvalues.round(4),
+})
+print("\n--- Normal vs HAC standart hata ---")
+print("(t_HAC << t_normal ise otokorelasyon anlamlılığı şişirmiş demektir)")
+print(karsilastirma.to_string(index=False))
+
+# --- Artık otokorelasyon grafiği ---
+fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+axes[0].plot(resid, "o-", lw=1)
+axes[0].axhline(0, color="gray", lw=0.8)
+axes[0].set_title(f"Artıklar (DW={dw:.2f})")
+axes[0].grid(alpha=0.25)
+
+sm.graphics.tsa.plot_acf(resid, lags=min(20, len(resid)//2 - 1), ax=axes[1])
+axes[1].set_title("Artık ACF")
+plt.tight_layout(); plt.show()
+
+# --- VIF (2+ feature varsa) ---
+if len(FEAT_MODEL) >= 2:
+    Xv = X_model[m_train_full].values
+    vif = pd.DataFrame({
+        "feature": FEAT_MODEL,
+        "VIF": [variance_inflation_factor(Xv, i) for i in range(Xv.shape[1])],
+    })
+    print("\n--- VIF (>5 dikkat, >10 ciddi çoklu bağlantı) ---")
+    print(vif.round(2).to_string(index=False))
+
+    print("\n--- Feature korelasyon matrisi ---")
+    print(X_model[m_train_full].corr().round(3).to_string())
+else:
+    print("\nVIF: tek feature -> hesaplanamaz (çoklu bağlantı riski yok)")
+
+
+# =============================================================================
+# 13) MANUEL TAHMİN FORMÜLÜ (202602 UYGULAMASI İÇİN)
+# =============================================================================
+def print_champion_info(CH):
+    feats = CH["features_model"]
+    b0s, bs = CH["intercept_std"], CH["coef_std"]
+    mu, sd  = CH["scaler_mean"],   CH["scaler_std"]
+    b0r, br = CH["intercept_raw"], CH["coef_raw"]
+
+    print("\n=== CHAMPION MODEL BİLGİLERİ ===")
+    print("Features      :", feats)
+    print("Intercept(std):", round(b0s, 6))
+    print("Coef(std)     :", [round(x, 6) for x in bs])
+    print("Mean          :", [round(x, 6) for x in mu])
+    print("Std           :", [round(x, 6) for x in sd])
+
+    std_terms = " + ".join([f"({bs[i]:.6f} * z_{feats[i]})" for i in range(len(feats))])
+    print("\nSTD uzay formülü:")
+    print(f"  y_hat = {b0s:.6f} + {std_terms}")
+
+    raw_terms = " + ".join([f"({br[i]:.6f} * {feats[i]})" for i in range(len(feats))])
+    print("\nHAM uzay formülü (manuel kullanım için en pratik):")
+    print(f"  y_hat = {b0r:.6f} + {raw_terms}")
+
+
+def predict_12m90_manual(feature_degerleri, CH):
+    """
+    feature_degerleri: {"2M30": 0.3915, "4M60": 0.12, ...} (yüzde cinsinden)
+    """
+    feats = CH["features_model"]
+    eksik = [f for f in feats if f not in feature_degerleri]
+    if eksik:
+        raise ValueError(f"Eksik feature: {eksik}. Gerekli: {feats}")
+
+    x = np.array([float(feature_degerleri[f]) for f in feats])
+
+    z     = (x - CH["scaler_mean"]) / CH["scaler_std"]
+    y_std = CH["intercept_std"] + np.sum(CH["coef_std"] * z)
+    y_raw = CH["intercept_raw"] + np.sum(CH["coef_raw"] * x)
+
+    return {
+        "girdiler":      dict(zip(feats, x.round(6))),
+        "z_degerleri":   dict(zip(feats, z.round(6))),
+        "tahmin_std":    y_std,
+        "tahmin_raw":    y_raw,
+        "kontrol_farki": abs(y_std - y_raw),
+    }
+
+
+print_champion_info(CHAMPION)
+
+# ---- 202602 kohortu için tahmin ----
+# NOT: Buraya 202602 kohortunun GERÇEKLEŞEN öncül oranlarını gir.
+#      (202602 kohortunun 2M30'u 202604'te, 4M60'ı 202606'da belli olur)
+apply_degerleri = {f: 0.0 for f in CHAMPION["features_model"]}
+apply_degerleri["2M30"] = 0.3915   # <-- ÖRNEK, gerçek değerle değiştir
+
+try:
+    res = predict_12m90_manual(apply_degerleri, CHAMPION)
+    print(f"\n=== {CONFIG['APPLY_DONEM']} KOHORTU TAHMİNİ ===")
+    print("Girdiler       :", res["girdiler"])
+    print("z değerleri    :", res["z_degerleri"])
+    print(f"Tahmin(std)    : {res['tahmin_std']:.6f} %")
+    print(f"Tahmin(raw)    : {res['tahmin_raw']:.6f} %")
+    print(f"Kontrol farkı  : {res['kontrol_farki']:.12f}")
+
+    # Belirsizlik bandı: CV katlarının MAE'si üzerinden
+    band = float(en_iyi["CV_MAE"])
+    print(f"\nTahmin aralığı (±CV_MAE): "
+          f"[{res['tahmin_raw'] - band:.4f} , {res['tahmin_raw'] + band:.4f}] %")
+except Exception as e:
+    print("\nManuel tahmin atlandı:", e)
+
+
+# =============================================================================
+# 14) SAĞLIK KONTROL LİSTESİ
+# =============================================================================
+print("\n" + "=" * 70)
+print("SAĞLIK KONTROLLERİ")
+print("=" * 70)
+
+kontroller = []
+
+cv_r2   = float(en_iyi["CV_R2"])
+tr_r2   = float(en_iyi["Train_R2"])
+oot_r2  = float(en_iyi["OOT_R2"])
+cv_mape = float(en_iyi["CV_MAPE"])
+cv_std  = float(en_iyi["CV_MAPE_STD"])
+drift   = float(en_iyi["Drift_MAPE"])
+
+kontroller.append(("CV R2 > 0", cv_r2 > 0, f"{cv_r2:.3f}"))
+kontroller.append(("CV R2 <= Train R2 (sızıntı yok)", cv_r2 <= tr_r2 + 0.02,
+                   f"CV={cv_r2:.3f} vs Train={tr_r2:.3f}"))
+kontroller.append(("OOT R2 > 0", oot_r2 > 0, f"{oot_r2:.3f}"))
+kontroller.append(("CV MAPE < 20%", cv_mape < 20, f"{cv_mape:.2f}%"))
+kontroller.append(("CV kararlı (std < MAPE/2)", cv_std < cv_mape / 2,
+                   f"std={cv_std:.2f} vs MAPE={cv_mape:.2f}"))
+kontroller.append(("Drift < 10pp", drift < 10, f"{drift:.2f}pp"))
+kontroller.append(("Durbin-Watson > 1.5", dw > 1.5, f"{dw:.3f}"))
+kontroller.append(("Katsayılar pozitif (öncül mantığı)",
+                   bool(np.all(CHAMPION["coef_raw"] > 0)),
+                   str([round(v, 4) for v in CHAMPION["coef_raw"]])))
+
+for ad, gecti, deger in kontroller:
+    print(f"  [{'OK ' if gecti else 'UYARI'}] {ad:<38} -> {deger}")
+
+basarisiz = [k[0] for k in kontroller if not k[1]]
+if basarisiz:
+    print(f"\n{len(basarisiz)} kontrol geçmedi — modeli kullanmadan önce incele:")
+    for b in basarisiz:
+        print(f"   - {b}")
+else:
+    print("\nTüm kontroller geçti.")
